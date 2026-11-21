@@ -214,39 +214,45 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     i_t, i_c, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_i, i_j = i_c // NC, i_c % NC
 
-    for i_h in range(H):
-        if IS_VARLEN:
-            i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-            T_val = eos - bos
-        else:
-            bos, eos = i_b * T, i_b * T + T
-            T_val = T
+    # Resolve the varlen metadata once: overwriting `i_t` with the local chunk
+    # index inside the i_h loop made every head after the first look up the
+    # wrong entry in chunk_indices.
+    if IS_VARLEN:
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_chunk = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T_val = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+        i_chunk = i_t
+        T_val = T
 
-        should_compute = (i_t * BT + i_i * BC < T_val) and (i_i > i_j)
+    for i_h in range(H):
+        should_compute = (i_chunk * BT + i_i * BC < T_val) and (i_i > i_j)
 
         if should_compute:
             k_ptr = k + (bos * H + i_h) * K
             g_ptr = g + (bos * H + i_h) * K
             A_ptr = A + (bos * H + i_h) * BT
 
-            p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T_val,), (H,), (i_t * BT + i_i * BC,), (BC,), (0,))
+            p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T_val,), (H,), (i_chunk * BT + i_i * BC,), (BC,), (0,))
             b_beta = tl.load(p_beta, boundary_check=(0,))
 
             b_A = tl.zeros([BC, BC], dtype=tl.float32)
             for i_k in range(tl.cdiv(K, BK)):
-                p_k = tl.make_block_ptr(k_ptr, (T_val, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK),
+                p_k = tl.make_block_ptr(k_ptr, (T_val, K), (H * K, 1), (i_chunk * BT + i_i * BC, i_k * BK), (BC, BK),
                                         (1, 0))
-                p_g = tl.make_block_ptr(g_ptr, (T_val, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK),
+                p_g = tl.make_block_ptr(g_ptr, (T_val, K), (H * K, 1), (i_chunk * BT + i_i * BC, i_k * BK), (BC, BK),
                                         (1, 0))
-                b_kt = tl.make_block_ptr(k_ptr, (K, T_val), (1, H * K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC),
+                b_kt = tl.make_block_ptr(k_ptr, (K, T_val), (1, H * K), (i_k * BK, i_chunk * BT + i_j * BC), (BK, BC),
                                          (0, 1))
-                p_gk = tl.make_block_ptr(g_ptr, (K, T_val), (1, H * K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC),
+                p_gk = tl.make_block_ptr(g_ptr, (K, T_val), (1, H * K), (i_k * BK, i_chunk * BT + i_j * BC), (BK, BC),
                                          (0, 1))
 
                 o_k = i_k * BK + tl.arange(0, BK)
                 m_k = o_k < K
-                b_gn = tl.load(g_ptr + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
+                b_gn = tl.load(g_ptr + (i_chunk * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
                 b_g = tl.load(p_g, boundary_check=(0, 1))
                 b_k = tl.load(p_k, boundary_check=(0, 1)) * tl.exp(b_g - b_gn[None, :])
                 b_gk = tl.load(p_gk, boundary_check=(0, 1))
@@ -254,7 +260,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
                 b_A += tl.dot(b_k, b_kt)
             b_A *= b_beta[:, None]
 
-            p_A = tl.make_block_ptr(A_ptr, (T_val, BT), (H * BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
+            p_A = tl.make_block_ptr(A_ptr, (T_val, BT), (H * BT, 1), (i_chunk * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
             tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -279,37 +285,40 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
 ):
     i_t, i_i, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
-    for i_h in range(H):
-        if IS_VARLEN:
-            i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-            T_val = eos - bos
-        else:
-            bos, eos = i_b * T, i_b * T + T
-            T_val = T
+    if IS_VARLEN:
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        i_chunk = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T_val = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+        i_chunk = i_t
+        T_val = T
 
-        should_compute = (i_t * BT + i_i * BC < T_val)
+    for i_h in range(H):
+        should_compute = (i_chunk * BT + i_i * BC < T_val)
 
         if should_compute:
             o_i = tl.arange(0, BC)
             o_k = tl.arange(0, BK)
             m_k = o_k < K
-            m_A = (i_t * BT + i_i * BC + o_i) < T_val
-            o_A = (bos + i_t * BT + i_i * BC + o_i) * H * BT + i_h * BT + i_i * BC
+            m_A = (i_chunk * BT + i_i * BC + o_i) < T_val
+            o_A = (bos + i_chunk * BT + i_i * BC + o_i) * H * BT + i_h * BT + i_i * BC
 
-            p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T_val, K), (H * K, 1), (i_t * BT + i_i * BC, 0), (BC, BK),
+            p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T_val, K), (H * K, 1), (i_chunk * BT + i_i * BC, 0), (BC, BK),
                                     (1, 0))
-            p_g = tl.make_block_ptr(g + (bos * H + i_h) * K, (T_val, K), (H * K, 1), (i_t * BT + i_i * BC, 0), (BC, BK),
+            p_g = tl.make_block_ptr(g + (bos * H + i_h) * K, (T_val, K), (H * K, 1), (i_chunk * BT + i_i * BC, 0), (BC, BK),
                                     (1, 0))
-            p_beta = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
+            p_beta = beta + (bos + i_chunk * BT + i_i * BC + o_i) * H + i_h
 
             b_k = tl.load(p_k, boundary_check=(0, 1)) * tl.load(p_beta, mask=m_A, other=0)[:, None]
             b_g = tl.load(p_g, boundary_check=(0, 1))
 
-            p_kt = k + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
-            p_gk = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
+            p_kt = k + (bos + i_chunk * BT + i_i * BC) * H * K + i_h * K + o_k
+            p_gk = g + (bos + i_chunk * BT + i_i * BC) * H * K + i_h * K + o_k
 
-            for j in range(0, min(BC, T_val - i_t * BT - i_i * BC)):
+            for j in range(0, min(BC, T_val - i_chunk * BT - i_i * BC)):
                 b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
                 b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
                 b_A = tl.sum(b_k * b_kt[None, :] * tl.exp(b_g - b_gk[None, :]), 1)
@@ -361,8 +370,13 @@ def chunk_scaled_dot_kkt_fwd(
         raise ValueError(f"Expected beta/g head count Hv to be a multiple of Hk, got Hk={H_K}, Hv={H_V}.")
     BT = chunk_size
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    beta = beta.transpose(1, 2).contiguous()
-    g = g.transpose(1, 2).contiguous()
+    if gk is None:
+        beta = beta.transpose(1, 2).contiguous()
+        g = g.transpose(1, 2).contiguous() if g is not None else None
+    else:
+        # The gk kernels below read k/beta/gk token-major ([B,T,H,*]), while
+        # the public contract for k is head-major ([B,H,T,K]).
+        k = k.transpose(1, 2).contiguous()
     BK = 128
     kernel_num = 24
 
