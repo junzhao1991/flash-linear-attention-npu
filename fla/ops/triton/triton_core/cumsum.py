@@ -73,7 +73,21 @@ def chunk_local_cumsum_scalar(
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float
 ) -> torch.Tensor:
-    
+    if head_first:
+        # The kernel is token-major; honour the head-first public spelling by
+        # transposing around it, the same way the AscendC backend does.
+        out = chunk_local_cumsum_scalar(
+            g.transpose(1, 2).contiguous(),
+            chunk_size,
+            reverse=reverse,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices_out=chunk_indices_out,
+            head_first=False,
+            output_dtype=output_dtype,
+        )
+        return out.transpose(1, 2).contiguous()
+
     B, T, H = g.shape
     if chunk_size != 2 ** (chunk_size.bit_length() - 1):
         raise ValueError(
@@ -94,7 +108,7 @@ def chunk_local_cumsum_scalar(
         B=B,
         H=H,
         BLOCK_T=BT,
-        HEAD_FIRST=head_first,
+        HEAD_FIRST=False,
         REVERSE=reverse,
         CHUNK_SIZE=chunk_size,
         num_warps=4,
